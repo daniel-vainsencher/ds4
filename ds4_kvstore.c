@@ -742,9 +742,13 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     const int step = kv_cache_continued_step(kc);
     if (step <= 0) return 0;
     if (live_tokens < kc->opt.min_tokens) return 0;
-    if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
-    return live_tokens;
+    /* Compute the largest multiple of step that is <= live_tokens. This fires
+     * every time we cross a step boundary, regardless of prefill_chunk alignment,
+     * fixing the LCM stride issue where saves only fired at lcm(prefill_chunk, step). */
+    int target = (live_tokens / step) * step;
+    if (target < kc->opt.min_tokens) return 0;
+    if (target <= kc->continued_last_store_tokens) return 0;
+    return target;
 }
 
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
@@ -1318,32 +1322,21 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
         kc->continued_last_store_tokens = loaded;
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
-        bool consumed = false;
-        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
-            consumed = true;
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        } else {
-            ds4_kvstore_touch_file(path, hdr.hits + 1);
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        }
+        /* Never consume (unlink) loaded files — always keep them for reuse. */
+        ds4_kvstore_touch_file(path, hdr.hits + 1);
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                kv_log_name(kc),
+                responses_protocol ? " " : "",
+                responses_protocol ? "RESPPROTO" : "",
+                loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         if (result) {
             result->tokens = loaded;
             result->text_bytes = text_bytes;
             result->quant_bits = hdr.quant_bits;
             result->ext_flags = hdr.ext_flags;
             result->load_ms = load_ms;
-            result->consumed = consumed;
+            result->consumed = false;
             result->path = kv_xstrdup(path);
         }
     }

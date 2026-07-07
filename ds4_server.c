@@ -10196,9 +10196,7 @@ static void generate_job(server *s, job *j) {
     int cold_store_len = 0;
     if (cached == 0 &&
         s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+        prompt_for_sync->len >= s->kv.opt.min_tokens)
     {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
@@ -10206,17 +10204,10 @@ static void generate_job(server *s, job *j) {
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
-    int suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
-        /* A cold checkpoint can land exactly on the continued-checkpoint
-         * frontier.  The prefill progress callback would then write the same
-         * prefix as "continued" while we are intentionally stopping there to
-         * write it as "cold".  Mark the frontier as already handled before the
-         * sync reaches it; if the cold write fails, restore the old schedule so
-         * a later continued write can still try. */
-        suppressed_continued_last =
-            kv_cache_suppress_continued_store(&s->kv, cold_store_len);
-    }
+    /* Don't suppress continued saves during cold prefill — we want saves at
+     * every continued_interval_tokens boundary, not just a single cold save.
+     * The dedup logic in kv_cache_existing_compatible will skip writing if
+     * a continued save already wrote the same prefix. */
 
     if (s->kv.enabled &&
         cold_store_len >= s->kv.opt.min_tokens &&
@@ -10229,8 +10220,6 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
@@ -10239,11 +10228,6 @@ static void generate_job(server *s, job *j) {
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
-            suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
-            suppressed_continued_last = -1;
         }
         ds4_tokens_free(&prefix);
     }
@@ -10252,8 +10236,6 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
-        kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                              cold_store_len);
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
@@ -10279,10 +10261,6 @@ static void generate_job(server *s, job *j) {
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
-            suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
         }
     }
     char id[96];
