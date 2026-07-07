@@ -252,9 +252,11 @@ q4k-dot-test: tests/test_q4k_dot.c
 # ============================================================================
 # Oracle libraries for ds4rust testing
 # -Dstatic= removes static linkage so all functions are exported
+# ds4.c references functions from ds4_ssd.c and ds4_distributed.c, so we
+# include those in the oracle library too.
 # ============================================================================
 
-libds4_oracle.a: ds4_oracle.o
+libds4_oracle.a: ds4_oracle.o ds4_ssd.o ds4_distributed.o
 	$(AR) rcs $@ $^
 
 ds4_oracle.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h
