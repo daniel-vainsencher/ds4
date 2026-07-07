@@ -2052,15 +2052,18 @@ extern "C" int ds4_gpu_test_moe_gate_up_mid_q2k_wmma_tensor(
     f32_to_f16_kernel<<<(x_count + 255u) / 256u, 256u>>>(x_h_dev, (const float *)x->ptr, x_count);
     if (!cuda_ok(cudaGetLastError(), "test_moe_gate_up_mid_q2k_wmma x f32_to_f16")) return 0;
 
-    /* Launch WMMA kernel with production parameters (X_F16=true, OUT_F16=true) */
-    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u, MTILES = 8u;
-    const uint32_t m_tiles = (n_pairs + MTILES * BM - 1u) / (MTILES * BM);
-    const uint32_t n_tiles = (expert_mid_dim + 2u * BN - 1u) / (2u * BN);
-    const dim3 grid(n_tiles, m_tiles, 1u);
+    /* Launch WMMA kernel with production parameters (X_F16=true, OUT_F16=true)
+     * Production uses MTILES=4, 128 threads (32*4), and grid based on hot_max. */
+    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u, MTILES = 4u;
+    const uint32_t hot_max = n_pairs;  /* All tokens in one expert bucket */
+    const dim3 block(32u * MTILES, 1u, 1u);
+    const dim3 grid((expert_mid_dim + 2u * BN - 1u) / (2u * BN),
+                    (hot_max + MTILES * BM - 1u) / (MTILES * BM),
+                    1u);  /* hot_count = 1 */
     const size_t shmem = (MTILES * BM * BK + 4u * BK * BN) * sizeof(half) +
                          4u * MTILES * BM * BN * sizeof(float);
 
-    moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<MTILES, BM, BN, BK, true, true><<<grid, 256u, shmem>>>(
+    moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<MTILES, BM, BN, BK, true, true><<<grid, block, shmem>>>(
             NULL,  /* mid_out - not used when OUT_F16=true */
             mid_h_dev,
             (const char *)gate_weights->ptr,
@@ -2177,15 +2180,18 @@ extern "C" int ds4_gpu_test_moe_down_q2k_wmma_tensor(
     f32_to_f16_kernel<<<(mid_count + 255u) / 256u, 256u>>>(mid_h_dev, (const float *)mid->ptr, mid_count);
     if (!cuda_ok(cudaGetLastError(), "test_moe_down_q2k_wmma mid f32_to_f16")) return 0;
 
-    /* Launch WMMA kernel with production parameters (MID_F16=true, OUT_F16=true) */
-    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u, MTILES = 8u;
-    const uint32_t m_tiles = (n_pairs + MTILES * BM - 1u) / (MTILES * BM);
-    const uint32_t n_tiles = (out_dim + 2u * BN - 1u) / (2u * BN);
-    const dim3 grid(n_tiles, m_tiles, 1u);
+    /* Launch WMMA kernel with production parameters (MID_F16=true, OUT_F16=true)
+     * Production uses MTILES=4, 128 threads (32*4), and grid based on hot_max. */
+    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u, MTILES = 4u;
+    const uint32_t hot_max = n_pairs;  /* All tokens in one expert bucket */
+    const dim3 block(32u * MTILES, 1u, 1u);
+    const dim3 grid((out_dim + 2u * BN - 1u) / (2u * BN),
+                    (hot_max + MTILES * BM - 1u) / (MTILES * BM),
+                    1u);  /* hot_count = 1 */
     const size_t shmem = (MTILES * BM * BK + 2u * BK * BN) * sizeof(half) +
                          2u * MTILES * BM * BN * sizeof(float);
 
-    moe_down_q2K_hotlist_wmma_n2_kernel<MTILES, BM, BN, BK, true, true, false><<<grid, 256u, shmem>>>(
+    moe_down_q2K_hotlist_wmma_n2_kernel<MTILES, BM, BN, BK, true, true, false><<<grid, block, shmem>>>(
             NULL,  /* down_out - not used when OUT_F16=true */
             out_h_dev,
             (const char *)down_weights->ptr,

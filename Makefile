@@ -20,7 +20,7 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 else
-CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
+CFLAGS += -D_GNU_SOURCE -fno-finite-math-only -DDS4_ROCM_BUILD
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
@@ -28,15 +28,18 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
+# Default to ROCm; CUDA targets override CORE_OBJS
+CORE_OBJS ?= ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o
+CUDA_CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
-DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
-DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
+# Default to ROCm toolchain; override with CUDA settings if needed
+DS4_LINK ?= $(HIPCC) $(ROCM_CFLAGS)
+DS4_LINK_LIBS ?= $(ROCM_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -91,10 +94,18 @@ help:
 	@echo "  make clean               Remove build outputs"
 
 cuda-spark:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= \
+		CORE_OBJS="$(CUDA_CORE_OBJS)" \
+		CFLAGS="$(subst -DDS4_ROCM_BUILD,,$(CFLAGS))" \
+		DS4_LINK="$(NVCC) $(NVCCFLAGS)" \
+		DS4_LINK_LIBS="$(CUDA_LDLIBS)"
 
 cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native \
+		CORE_OBJS="$(CUDA_CORE_OBJS)" \
+		CFLAGS="$(subst -DDS4_ROCM_BUILD,,$(CFLAGS))" \
+		DS4_LINK="$(NVCC) $(NVCCFLAGS)" \
+		DS4_LINK_LIBS="$(CUDA_LDLIBS)"
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
@@ -102,16 +113,14 @@ cuda:
 		echo "       or use make cuda-spark / make cuda-generic"; \
 		exit 2; \
 	fi
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)" \
+		CORE_OBJS="$(CUDA_CORE_OBJS)" \
+		CFLAGS="$(subst -DDS4_ROCM_BUILD,,$(CFLAGS))" \
+		DS4_LINK="$(NVCC) $(NVCCFLAGS)" \
+		DS4_LINK_LIBS="$(CUDA_LDLIBS)"
 
-strix-halo:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o" \
-		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
-		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
-		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
-
-rocm: strix-halo
+strix-halo rocm:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
 ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -221,14 +230,14 @@ ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(DS4_LINK) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
 ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
 else
-	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
+	$(DS4_LINK) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
