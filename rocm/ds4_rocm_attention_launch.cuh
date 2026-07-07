@@ -1361,3 +1361,89 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                                       use_dp4a);
     return cuda_ok(cudaGetLastError(), "attention_output_low_q8 launch");
 }
+
+/* =========================================================================
+ * Test Kernel Wrappers.
+ * =========================================================================
+ *
+ * These expose internal kernels for CPU-GPU comparison testing and can be
+ * reused by external test harnesses.
+ */
+
+extern "C" int ds4_gpu_test_attention_decode_mixed_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *sinks,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim) {
+    if (!heads || !sinks || !q || !raw_kv || n_tokens == 0 || n_head == 0 || head_dim == 0) return 0;
+    if (n_raw == 0 && n_comp == 0) return 0;
+    if (raw_cap < n_raw) return 0;
+    if (n_comp != 0 && !comp_kv) return 0;
+
+    const uint64_t head_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t q_bytes = head_bytes;
+    const uint64_t raw_bytes = (uint64_t)raw_cap * head_dim * sizeof(float);
+    const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+    const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+
+    if (heads->bytes < head_bytes ||
+        q->bytes < q_bytes ||
+        raw_kv->bytes < raw_bytes ||
+        sinks->bytes < sink_bytes ||
+        (n_comp != 0 && comp_kv->bytes < comp_bytes)) return 0;
+
+    /* Use the heads8 online kernel for head_dim=512 (DS4's default) */
+    if (head_dim == 512u) {
+        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1u);
+        attention_decode_mixed_heads8_online_kernel<<<grid, 256>>>(
+                (float *)heads->ptr,
+                (const float *)sinks->ptr,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                n_tokens,
+                pos0,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+        return cuda_ok(cudaGetLastError(), "test_attention_decode_mixed_heads8 launch");
+    }
+
+    /* Fallback to generic decode kernel */
+    dim3 grid(n_tokens, n_head, 1u);
+    attention_decode_mixed_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            (const float *)sinks->ptr,
+            (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_comp ? (const float *)comp_kv->ptr : NULL,
+            NULL,  /* comp_mask */
+            0,     /* use_comp_mask */
+            n_tokens,
+            pos0,
+            n_raw,
+            raw_cap,
+            raw_start,
+            n_comp,
+            window,
+            ratio,
+            n_head,
+            head_dim);
+    return cuda_ok(cudaGetLastError(), "test_attention_decode_mixed launch");
+}

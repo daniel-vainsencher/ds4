@@ -1745,3 +1745,468 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens);
 }
+
+/* =========================================================================
+ * Test Kernels for Quantized Dot Products and MoE Operations
+ * =========================================================================
+ *
+ * These test functions expose internal kernels for CPU-GPU comparison testing.
+ */
+
+__global__ static void test_dot_q2_K_q8_K_kernel(
+        float *out,
+        const cuda_block_q2_K *weights,
+        const cuda_block_q8_K *x_q8,
+        uint32_t n_rows,
+        uint32_t n_blocks) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const cuda_block_q2_K *w_row = weights + (uint64_t)row * n_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        acc += dev_dot_q2_K_q8_K_block(w_row + b, x_q8 + b);
+    }
+    out[row] = acc;
+}
+
+__global__ static void test_dot_iq2_xxs_q8_K_kernel(
+        float *out,
+        const cuda_block_iq2_xxs *weights,
+        const cuda_block_q8_K *x_q8,
+        uint32_t n_rows,
+        uint32_t n_blocks) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    const cuda_block_iq2_xxs *w_row = weights + (uint64_t)row * n_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        acc += dev_dot_iq2_xxs_q8_K_block(w_row + b, x_q8 + b);
+    }
+    out[row] = acc;
+}
+
+extern "C" int ds4_gpu_test_dot_q2_K_q8_K_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x_q8,
+        uint32_t n_rows,
+        uint32_t n_blocks) {
+    if (!out || !weights || !x_q8 || n_rows == 0 || n_blocks == 0) return 0;
+
+    const uint64_t weight_bytes = (uint64_t)n_rows * n_blocks * sizeof(cuda_block_q2_K);
+    const uint64_t x_bytes = (uint64_t)n_blocks * sizeof(cuda_block_q8_K);
+    const uint64_t out_bytes = (uint64_t)n_rows * sizeof(float);
+
+    if (weights->bytes < weight_bytes ||
+        x_q8->bytes < x_bytes ||
+        out->bytes < out_bytes) return 0;
+
+    const uint32_t threads = 256;
+    const uint32_t blocks = (n_rows + threads - 1) / threads;
+
+    test_dot_q2_K_q8_K_kernel<<<blocks, threads>>>(
+            (float *)out->ptr,
+            (const cuda_block_q2_K *)weights->ptr,
+            (const cuda_block_q8_K *)x_q8->ptr,
+            n_rows,
+            n_blocks);
+
+    return cuda_ok(cudaGetLastError(), "test_dot_q2_K_q8_K launch");
+}
+
+extern "C" int ds4_gpu_test_dot_iq2_xxs_q8_K_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x_q8,
+        uint32_t n_rows,
+        uint32_t n_blocks) {
+    if (!out || !weights || !x_q8 || n_rows == 0 || n_blocks == 0) return 0;
+
+    const uint64_t weight_bytes = (uint64_t)n_rows * n_blocks * sizeof(cuda_block_iq2_xxs);
+    const uint64_t x_bytes = (uint64_t)n_blocks * sizeof(cuda_block_q8_K);
+    const uint64_t out_bytes = (uint64_t)n_rows * sizeof(float);
+
+    if (weights->bytes < weight_bytes ||
+        x_q8->bytes < x_bytes ||
+        out->bytes < out_bytes) return 0;
+
+    const uint32_t threads = 256;
+    const uint32_t blocks = (n_rows + threads - 1) / threads;
+
+    test_dot_iq2_xxs_q8_K_kernel<<<blocks, threads>>>(
+            (float *)out->ptr,
+            (const cuda_block_iq2_xxs *)weights->ptr,
+            (const cuda_block_q8_K *)x_q8->ptr,
+            n_rows,
+            n_blocks);
+
+    return cuda_ok(cudaGetLastError(), "test_dot_iq2_xxs_q8_K launch");
+}
+
+/* Test MoE gate/up/mid with IQ2_XXS weights (non-WMMA path) */
+__global__ static void test_moe_gate_up_mid_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const cuda_block_iq2_xxs *gate_weights,
+        const cuda_block_iq2_xxs *up_weights,
+        const cuda_block_q8_K *x_q8,
+        uint32_t expert_mid_dim,
+        uint32_t n_blocks,
+        float router_weight,
+        float clamp) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= expert_mid_dim) return;
+
+    const cuda_block_iq2_xxs *g_row = gate_weights + (uint64_t)row * n_blocks;
+    const cuda_block_iq2_xxs *u_row = up_weights + (uint64_t)row * n_blocks;
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        gate += dev_dot_iq2_xxs_q8_K_block(g_row + b, x_q8 + b);
+        up += dev_dot_iq2_xxs_q8_K_block(u_row + b, x_q8 + b);
+    }
+
+    /* Apply activation clamping if enabled */
+    if (clamp > 1.0e-6f) {
+        if (gate > clamp) gate = clamp;
+        if (up > clamp) up = clamp;
+        if (up < -clamp) up = -clamp;
+    }
+
+    gate_out[row] = gate;
+    up_out[row] = up;
+
+    /* SwiGLU: mid = swiglu(gate) * up * router_weight */
+    mid_out[row] = (gate / (1.0f + expf(-gate))) * up * router_weight;
+}
+
+extern "C" int ds4_gpu_test_moe_gate_up_mid_tensor(
+        ds4_gpu_tensor *gate_out,
+        ds4_gpu_tensor *up_out,
+        ds4_gpu_tensor *mid_out,
+        const ds4_gpu_tensor *gate_weights,
+        const ds4_gpu_tensor *up_weights,
+        const ds4_gpu_tensor *x_q8,
+        uint32_t expert_mid_dim,
+        uint32_t n_blocks,
+        float router_weight,
+        float clamp) {
+    if (!gate_out || !up_out || !mid_out || !gate_weights || !up_weights || !x_q8) return 0;
+    if (expert_mid_dim == 0 || n_blocks == 0) return 0;
+
+    const uint64_t weight_bytes = (uint64_t)expert_mid_dim * n_blocks * sizeof(cuda_block_iq2_xxs);
+    const uint64_t x_bytes = (uint64_t)n_blocks * sizeof(cuda_block_q8_K);
+    const uint64_t out_bytes = (uint64_t)expert_mid_dim * sizeof(float);
+
+    if (gate_weights->bytes < weight_bytes ||
+        up_weights->bytes < weight_bytes ||
+        x_q8->bytes < x_bytes ||
+        gate_out->bytes < out_bytes ||
+        up_out->bytes < out_bytes ||
+        mid_out->bytes < out_bytes) return 0;
+
+    const uint32_t threads = 256;
+    const uint32_t blocks = (expert_mid_dim + threads - 1) / threads;
+
+    test_moe_gate_up_mid_kernel<<<blocks, threads>>>(
+            (float *)gate_out->ptr,
+            (float *)up_out->ptr,
+            (float *)mid_out->ptr,
+            (const cuda_block_iq2_xxs *)gate_weights->ptr,
+            (const cuda_block_iq2_xxs *)up_weights->ptr,
+            (const cuda_block_q8_K *)x_q8->ptr,
+            expert_mid_dim,
+            n_blocks,
+            router_weight,
+            clamp);
+
+    return cuda_ok(cudaGetLastError(), "test_moe_gate_up_mid launch");
+}
+
+/* =========================================================================
+ * WMMA Test Kernels for Q2_K MoE Operations
+ * =========================================================================
+ *
+ * These test functions exercise the WMMA-accelerated MoE kernels using the
+ * same code paths as production (half-precision input/output). The test
+ * harness converts float tensors to/from half precision to match production.
+ */
+
+/**
+ * Test MoE gate/up/mid projection with Q2_K weights using WMMA.
+ *
+ * This tests the first half of an MoE expert using WMMA acceleration:
+ *   gate[t,r] = dot(gate_weights[r], x[t])
+ *   up[t,r] = dot(up_weights[r], x[t])
+ *   mid[t,r] = swiglu(gate[t,r]) * up[t,r] * router_weight
+ *
+ * Returns 0 on platforms without WMMA support (non-ROCm).
+ *
+ * Parameters:
+ *   mid_out        - Output: [n_tokens*6, expert_mid_dim] float (sparse, indexed by pair)
+ *   gate_weights   - Q2_K gate weights: [expert_mid_dim, expert_in_dim/256] blocks
+ *   up_weights     - Q2_K up weights: [expert_mid_dim, expert_in_dim/256] blocks
+ *   x              - Input: [n_tokens, expert_in_dim] float
+ *   router_weight  - Scalar routing weight
+ *   n_tokens       - Number of input tokens
+ *   expert_in_dim  - Input dimension (must be multiple of 256)
+ *   expert_mid_dim - Output dimension
+ *   clamp          - Activation clamping value (0 to disable)
+ */
+extern "C" int ds4_gpu_test_moe_gate_up_mid_q2k_wmma_tensor(
+        ds4_gpu_tensor       *mid_out,
+        const ds4_gpu_tensor *gate_weights,
+        const ds4_gpu_tensor *up_weights,
+        const ds4_gpu_tensor *x,
+        float                 router_weight,
+        uint32_t              n_tokens,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        float                 clamp) {
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+    (void)mid_out; (void)gate_weights; (void)up_weights; (void)x;
+    (void)router_weight; (void)n_tokens; (void)expert_in_dim; (void)expert_mid_dim; (void)clamp;
+    return 0;  /* WMMA not available */
+#else
+    if (!mid_out || !gate_weights || !up_weights || !x) return 0;
+    if (n_tokens == 0 || expert_in_dim == 0 || expert_mid_dim == 0) return 0;
+    if ((expert_in_dim & 255u) != 0) return 0;  /* Must be multiple of 256 */
+
+    const uint32_t n_blocks = expert_in_dim / CUDA_QK_K;
+    const uint64_t gate_row_bytes = (uint64_t)n_blocks * sizeof(cuda_block_q2_K);
+    const uint64_t weight_bytes = (uint64_t)expert_mid_dim * gate_row_bytes;
+    const uint64_t x_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(float);
+    /* Output is indexed by pair = token * 6 + slot (slot=0 for test).
+     * We need space for pairs 0, 6, 12, ..., (n_tokens-1)*6. */
+    const uint32_t max_pair = n_tokens * 6u;
+    const uint64_t mid_bytes = (uint64_t)max_pair * expert_mid_dim * sizeof(float);
+
+    if (gate_weights->bytes < weight_bytes ||
+        up_weights->bytes < weight_bytes ||
+        x->bytes < x_bytes ||
+        mid_out->bytes < mid_bytes) return 0;
+
+    /* Allocate temporary buffers for hotlist kernel interface.
+     * We simulate a single "hot" expert with all tokens routed to it. */
+    const uint32_t n_pairs = n_tokens;  /* 1 slot per token */
+
+    /* Allocate scratch: counts[1], offsets[1], pairs[n_pairs], weights[max_pair], hot_experts[1],
+     * x_h[n_tokens * expert_in_dim], mid_h[max_pair * expert_mid_dim] */
+    const size_t counts_bytes = sizeof(uint32_t);
+    const size_t offsets_bytes = sizeof(uint32_t);
+    const size_t pairs_bytes = (size_t)n_pairs * sizeof(uint32_t);
+    const size_t router_weights_bytes = (size_t)max_pair * sizeof(float);
+    const size_t hot_bytes = sizeof(uint32_t);
+    const size_t x_h_bytes = (size_t)n_tokens * expert_in_dim * sizeof(half);
+    const size_t mid_h_bytes = (size_t)max_pair * expert_mid_dim * sizeof(half);
+    const size_t total_scratch = counts_bytes + offsets_bytes + pairs_bytes +
+                                 router_weights_bytes + hot_bytes + x_h_bytes + mid_h_bytes;
+
+    char *scratch = (char *)cuda_tmp_alloc(total_scratch, "moe_q2k_wmma_test scratch");
+    if (!scratch) return 0;
+
+    uint32_t *counts_dev = (uint32_t *)scratch;
+    uint32_t *offsets_dev = (uint32_t *)(scratch + counts_bytes);
+    uint32_t *pairs_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes);
+    float *weights_dev = (float *)(scratch + counts_bytes + offsets_bytes + pairs_bytes);
+    uint32_t *hot_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + pairs_bytes + router_weights_bytes);
+    half *x_h_dev = (half *)(scratch + counts_bytes + offsets_bytes + pairs_bytes + router_weights_bytes + hot_bytes);
+    half *mid_h_dev = (half *)(scratch + counts_bytes + offsets_bytes + pairs_bytes + router_weights_bytes + hot_bytes + x_h_bytes);
+
+    /* Initialize control arrays on host and copy */
+    uint32_t h_counts = n_pairs;
+    uint32_t h_offsets = 0;
+    uint32_t h_hot = 0;  /* Expert 0 */
+    uint32_t *h_pairs = (uint32_t *)malloc(pairs_bytes);
+    float *h_weights = (float *)malloc(router_weights_bytes);
+    if (!h_pairs || !h_weights) {
+        free(h_pairs);
+        free(h_weights);
+        return 0;
+    }
+    memset(h_weights, 0, router_weights_bytes);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t pair = t * 6u;  /* pair = token * 6 + slot, slot=0 */
+        h_pairs[t] = pair;
+        h_weights[pair] = router_weight;  /* Indexed by pair value */
+    }
+
+    if (cudaMemcpy(counts_dev, &h_counts, counts_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(offsets_dev, &h_offsets, offsets_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(pairs_dev, h_pairs, pairs_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(weights_dev, h_weights, router_weights_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(hot_dev, &h_hot, hot_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        free(h_pairs);
+        free(h_weights);
+        return 0;
+    }
+    free(h_pairs);
+    free(h_weights);
+
+    /* Convert input x from float to half (production uses half precision) */
+    const uint32_t x_count = n_tokens * expert_in_dim;
+    f32_to_f16_kernel<<<(x_count + 255u) / 256u, 256u>>>(x_h_dev, (const float *)x->ptr, x_count);
+    if (!cuda_ok(cudaGetLastError(), "test_moe_gate_up_mid_q2k_wmma x f32_to_f16")) return 0;
+
+    /* Launch WMMA kernel with production parameters (X_F16=true, OUT_F16=true) */
+    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u, MTILES = 8u;
+    const uint32_t m_tiles = (n_pairs + MTILES * BM - 1u) / (MTILES * BM);
+    const uint32_t n_tiles = (expert_mid_dim + 2u * BN - 1u) / (2u * BN);
+    const dim3 grid(n_tiles, m_tiles, 1u);
+    const size_t shmem = (MTILES * BM * BK + 4u * BK * BN) * sizeof(half) +
+                         4u * MTILES * BM * BN * sizeof(float);
+
+    moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel<MTILES, BM, BN, BK, true, true><<<grid, 256u, shmem>>>(
+            NULL,  /* mid_out - not used when OUT_F16=true */
+            mid_h_dev,
+            (const char *)gate_weights->ptr,
+            (const char *)up_weights->ptr,
+            NULL,  /* x - not used when X_F16=true */
+            x_h_dev,
+            weights_dev,
+            counts_dev,
+            offsets_dev,
+            pairs_dev,
+            hot_dev,
+            1u,  /* hot_count */
+            expert_in_dim,
+            expert_mid_dim,
+            weight_bytes,  /* gate_expert_bytes */
+            gate_row_bytes,
+            clamp);
+    if (!cuda_ok(cudaGetLastError(), "test_moe_gate_up_mid_q2k_wmma launch")) return 0;
+
+    /* Convert output from half to float */
+    const uint32_t mid_count = max_pair * expert_mid_dim;
+    f16_to_f32_kernel<<<(mid_count + 255u) / 256u, 256u>>>((float *)mid_out->ptr, mid_h_dev, mid_count);
+
+    return cuda_ok(cudaGetLastError(), "test_moe_gate_up_mid_q2k_wmma mid f16_to_f32");
+#endif
+}
+
+/**
+ * Test MoE down projection with Q2_K weights using WMMA.
+ *
+ * This tests the second half of an MoE expert using WMMA acceleration:
+ *   out[t,r] = dot(down_weights[r], mid[t])
+ *
+ * Returns 0 on platforms without WMMA support (non-ROCm).
+ *
+ * Parameters:
+ *   out            - Output: [n_tokens*6, out_dim] float (sparse, indexed by pair)
+ *   down_weights   - Q2_K down weights: [out_dim, expert_mid_dim/256] blocks
+ *   mid            - Input: [n_tokens*6, expert_mid_dim] float (sparse, indexed by pair)
+ *   n_tokens       - Number of input tokens
+ *   expert_mid_dim - Mid dimension (must be multiple of 256)
+ *   out_dim        - Output dimension
+ */
+extern "C" int ds4_gpu_test_moe_down_q2k_wmma_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *down_weights,
+        const ds4_gpu_tensor *mid,
+        uint32_t              n_tokens,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim) {
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+    (void)out; (void)down_weights; (void)mid;
+    (void)n_tokens; (void)expert_mid_dim; (void)out_dim;
+    return 0;  /* WMMA not available */
+#else
+    if (!out || !down_weights || !mid) return 0;
+    if (n_tokens == 0 || expert_mid_dim == 0 || out_dim == 0) return 0;
+    if ((expert_mid_dim & 255u) != 0) return 0;  /* Must be multiple of 256 */
+
+    const uint32_t mid_blocks = expert_mid_dim / CUDA_QK_K;
+    const uint64_t down_row_bytes = (uint64_t)mid_blocks * sizeof(cuda_block_q2_K);
+    const uint64_t weight_bytes = (uint64_t)out_dim * down_row_bytes;
+    /* Both input and output are indexed by pair = token * 6 + slot (slot=0 for test) */
+    const uint32_t max_pair = n_tokens * 6u;
+    const uint64_t mid_bytes = (uint64_t)max_pair * expert_mid_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)max_pair * out_dim * sizeof(float);
+
+    if (down_weights->bytes < weight_bytes ||
+        mid->bytes < mid_bytes ||
+        out->bytes < out_bytes) return 0;
+
+    /* Allocate temporary buffers for hotlist kernel interface */
+    const uint32_t n_pairs = n_tokens;
+
+    const size_t counts_bytes = sizeof(uint32_t);
+    const size_t offsets_bytes = sizeof(uint32_t);
+    const size_t pairs_bytes = (size_t)n_pairs * sizeof(uint32_t);
+    const size_t hot_bytes = sizeof(uint32_t);
+    const size_t mid_h_bytes = (size_t)max_pair * expert_mid_dim * sizeof(half);
+    const size_t out_h_bytes = (size_t)max_pair * out_dim * sizeof(half);
+    const size_t total_scratch = counts_bytes + offsets_bytes + pairs_bytes + hot_bytes + mid_h_bytes + out_h_bytes;
+
+    char *scratch = (char *)cuda_tmp_alloc(total_scratch, "moe_down_q2k_wmma_test scratch");
+    if (!scratch) return 0;
+
+    uint32_t *counts_dev = (uint32_t *)scratch;
+    uint32_t *offsets_dev = (uint32_t *)(scratch + counts_bytes);
+    uint32_t *pairs_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes);
+    uint32_t *hot_dev = (uint32_t *)(scratch + counts_bytes + offsets_bytes + pairs_bytes);
+    half *mid_h_dev = (half *)(scratch + counts_bytes + offsets_bytes + pairs_bytes + hot_bytes);
+    half *out_h_dev = (half *)(scratch + counts_bytes + offsets_bytes + pairs_bytes + hot_bytes + mid_h_bytes);
+
+    /* Initialize control arrays on host and copy */
+    uint32_t h_counts = n_pairs;
+    uint32_t h_offsets = 0;
+    uint32_t h_hot = 0;
+    uint32_t *h_pairs = (uint32_t *)malloc(pairs_bytes);
+    if (!h_pairs) return 0;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        h_pairs[t] = t * 6u;  /* pair = token * 6 + slot, slot=0 */
+    }
+
+    if (cudaMemcpy(counts_dev, &h_counts, counts_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(offsets_dev, &h_offsets, offsets_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(pairs_dev, h_pairs, pairs_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(hot_dev, &h_hot, hot_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        free(h_pairs);
+        return 0;
+    }
+    free(h_pairs);
+
+    /* Convert input mid from float to half (production uses half precision) */
+    const uint32_t mid_count = max_pair * expert_mid_dim;
+    f32_to_f16_kernel<<<(mid_count + 255u) / 256u, 256u>>>(mid_h_dev, (const float *)mid->ptr, mid_count);
+    if (!cuda_ok(cudaGetLastError(), "test_moe_down_q2k_wmma mid f32_to_f16")) return 0;
+
+    /* Launch WMMA kernel with production parameters (MID_F16=true, OUT_F16=true) */
+    constexpr uint32_t BM = 16u, BN = 16u, BK = 16u, MTILES = 8u;
+    const uint32_t m_tiles = (n_pairs + MTILES * BM - 1u) / (MTILES * BM);
+    const uint32_t n_tiles = (out_dim + 2u * BN - 1u) / (2u * BN);
+    const dim3 grid(n_tiles, m_tiles, 1u);
+    const size_t shmem = (MTILES * BM * BK + 2u * BK * BN) * sizeof(half) +
+                         2u * MTILES * BM * BN * sizeof(float);
+
+    moe_down_q2K_hotlist_wmma_n2_kernel<MTILES, BM, BN, BK, true, true, false><<<grid, 256u, shmem>>>(
+            NULL,  /* down_out - not used when OUT_F16=true */
+            out_h_dev,
+            (const char *)down_weights->ptr,
+            NULL,  /* mid - not used when MID_F16=true */
+            mid_h_dev,
+            counts_dev,
+            offsets_dev,
+            pairs_dev,
+            hot_dev,
+            1u,  /* hot_count */
+            expert_mid_dim,
+            out_dim,
+            weight_bytes,  /* down_expert_bytes */
+            down_row_bytes,
+            n_tokens);
+    if (!cuda_ok(cudaGetLastError(), "test_moe_down_q2k_wmma launch")) return 0;
+
+    /* Convert output from half to float */
+    const uint32_t out_count = max_pair * out_dim;
+    f16_to_f32_kernel<<<(out_count + 255u) / 256u, 256u>>>((float *)out->ptr, out_h_dev, out_count);
+
+    return cuda_ok(cudaGetLastError(), "test_moe_down_q2k_wmma out f16_to_f32");
+#endif
+}

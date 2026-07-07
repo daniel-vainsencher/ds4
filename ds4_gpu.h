@@ -1017,6 +1017,208 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+/* =========================================================================
+ * Quantized Dot Product Test Kernels.
+ * =========================================================================
+ *
+ * These functions expose the Q2_K and IQ2_XXS dot product kernels for testing
+ * GPU implementations against CPU reference implementations.  Each computes
+ * dot products between quantized weight blocks and Q8_K activation blocks.
+ *
+ * Parameters:
+ *   out       - Output tensor for dot product results (n_rows floats)
+ *   weights   - Device tensor containing quantized weight blocks (Q2_K or IQ2_XXS)
+ *   x_q8      - Device tensor containing Q8_K quantized activation blocks
+ *   n_rows    - Number of output rows (dot products to compute)
+ *   n_blocks  - Number of quantized blocks per row (row_dim / 256)
+ *
+ * Returns nonzero on success, 0 on failure.
+ */
+int ds4_gpu_test_dot_q2_K_q8_K_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x_q8,
+        uint32_t              n_rows,
+        uint32_t              n_blocks);
+
+int ds4_gpu_test_dot_iq2_xxs_q8_K_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x_q8,
+        uint32_t              n_rows,
+        uint32_t              n_blocks);
+
+/**
+ * Test MoE gate/up/mid computation for a single (token, expert) pair.
+ *
+ * This performs the forward pass of the first half of an MoE expert:
+ *   gate[row] = sum_b dot_iq2_xxs_q8_K(gate_weights[row,b], xq[b])
+ *   up[row]   = sum_b dot_iq2_xxs_q8_K(up_weights[row,b], xq[b])
+ *   mid[row]  = swiglu(gate[row]) * up[row] * router_weight
+ *
+ * where swiglu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ *
+ * Parameters:
+ *   gate_out     - Output: [expert_mid_dim] float gate values
+ *   up_out       - Output: [expert_mid_dim] float up values
+ *   mid_out      - Output: [expert_mid_dim] float mid values (SwiGLU output)
+ *   gate_weights - [expert_mid_dim, n_blocks] IQ2_XXS gate projection weights
+ *   up_weights   - [expert_mid_dim, n_blocks] IQ2_XXS up projection weights
+ *   x_q8         - [n_blocks] Q8_K quantized input activations
+ *   expert_mid_dim - Number of output rows (MoE intermediate dimension)
+ *   n_blocks     - Number of Q8_K blocks per row (expert_in_dim / 256)
+ *   router_weight - Routing weight for this expert (typically from softmax)
+ *   clamp        - Activation clamping value (0 to disable)
+ *
+ * Returns nonzero on success, 0 on failure.
+ */
+int ds4_gpu_test_moe_gate_up_mid_tensor(
+        ds4_gpu_tensor       *gate_out,
+        ds4_gpu_tensor       *up_out,
+        ds4_gpu_tensor       *mid_out,
+        const ds4_gpu_tensor *gate_weights,
+        const ds4_gpu_tensor *up_weights,
+        const ds4_gpu_tensor *x_q8,
+        uint32_t              expert_mid_dim,
+        uint32_t              n_blocks,
+        float                 router_weight,
+        float                 clamp);
+
+/**
+ * Test RMS normalization with learned weight.
+ *
+ * out[row,i] = x[row,i] * rsqrt(mean(x[row]^2) + eps) * weight[i]
+ *
+ * Parameters:
+ *   out    - Output: [rows, n] float normalized values
+ *   x      - Input: [rows, n] float values to normalize
+ *   weight - Weight: [n] float per-channel scale
+ *   n      - Dimension per row
+ *   rows   - Number of rows
+ *   eps    - Epsilon for numerical stability
+ */
+int ds4_gpu_test_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weight,
+        uint32_t              n,
+        uint32_t              rows,
+        float                 eps);
+
+/**
+ * Test Q8_0 batched matrix multiplication (uses WMMA when available).
+ *
+ * out[t,r] = sum_k(dequant(weights[r,k]) * x[t,k])
+ *
+ * Parameters:
+ *   out      - Output: [n_tokens, out_dim] float
+ *   weights  - Q8_0 quantized weights: [out_dim, in_dim/32] blocks of 34 bytes
+ *   x        - Input: [n_tokens, in_dim] float
+ *   n_tokens - Number of input tokens
+ *   in_dim   - Input dimension (must be multiple of 32)
+ *   out_dim  - Output dimension
+ */
+int ds4_gpu_test_matmul_q8_0_f32_batch_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens,
+        uint32_t              in_dim,
+        uint32_t              out_dim);
+
+/**
+ * Test attention decode with mixed raw/compressed KV cache.
+ *
+ * Uses the heads8 online softmax kernel for head_dim=512.
+ *
+ * Parameters:
+ *   heads     - Output: [n_tokens, n_head, head_dim] attention output
+ *   sinks     - Attention sink scores: [n_head]
+ *   q         - Query: [n_tokens, n_head, head_dim]
+ *   raw_kv    - Raw KV cache: [raw_cap, head_dim]
+ *   comp_kv   - Compressed KV cache: [n_comp, head_dim] (NULL if n_comp=0)
+ *   n_tokens  - Number of query tokens
+ *   pos0      - Position of first token
+ *   n_raw     - Number of raw KV entries
+ *   raw_cap   - Capacity of raw KV ring buffer
+ *   raw_start - Start index in ring buffer
+ *   n_comp    - Number of compressed KV entries
+ *   window    - Attention window size (0 for unlimited)
+ *   ratio     - Compression ratio (0 to disable visibility limit)
+ *   n_head    - Number of attention heads
+ *   head_dim  - Dimension per head
+ */
+int ds4_gpu_test_attention_decode_mixed_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *sinks,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim);
+
+/**
+ * Test MoE gate/up projection with Q2_K weights using WMMA.
+ *
+ * Tests the first half of an MoE expert using WMMA acceleration:
+ *   mid[t,r] = swiglu(gate_dot) * up_dot * router_weight
+ *
+ * Returns 0 on platforms without WMMA support.
+ *
+ * Parameters:
+ *   mid_out        - Output: [n_tokens, expert_mid_dim] float
+ *   gate_weights   - Q2_K gate weights: [expert_mid_dim, expert_in_dim/256] blocks
+ *   up_weights     - Q2_K up weights: [expert_mid_dim, expert_in_dim/256] blocks
+ *   x              - Input: [n_tokens, expert_in_dim] float
+ *   router_weight  - Scalar routing weight
+ *   n_tokens       - Number of input tokens
+ *   expert_in_dim  - Input dimension (must be multiple of 256)
+ *   expert_mid_dim - Output dimension
+ *   clamp          - Activation clamping value (0 to disable)
+ */
+int ds4_gpu_test_moe_gate_up_mid_q2k_wmma_tensor(
+        ds4_gpu_tensor       *mid_out,
+        const ds4_gpu_tensor *gate_weights,
+        const ds4_gpu_tensor *up_weights,
+        const ds4_gpu_tensor *x,
+        float                 router_weight,
+        uint32_t              n_tokens,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        float                 clamp);
+
+/**
+ * Test MoE down projection with Q2_K weights using WMMA.
+ *
+ * Tests the second half of an MoE expert using WMMA acceleration:
+ *   out[t,r] = dot(down_weights[r], mid[t])
+ *
+ * Returns 0 on platforms without WMMA support.
+ *
+ * Parameters:
+ *   out            - Output: [n_tokens, out_dim] float
+ *   down_weights   - Q2_K down weights: [out_dim, expert_mid_dim/256] blocks
+ *   mid            - Input: [n_tokens, expert_mid_dim] float
+ *   n_tokens       - Number of input tokens
+ *   expert_mid_dim - Mid dimension (must be multiple of 256)
+ *   out_dim        - Output dimension
+ */
+int ds4_gpu_test_moe_down_q2k_wmma_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *down_weights,
+        const ds4_gpu_tensor *mid,
+        uint32_t              n_tokens,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim);
+
 #ifdef __cplusplus
 }
 #endif

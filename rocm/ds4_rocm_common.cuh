@@ -325,6 +325,11 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
+__global__ static void f16_to_f32_kernel(float *out, const __half *x, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(x[i]);
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)

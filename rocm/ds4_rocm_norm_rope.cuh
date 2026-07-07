@@ -589,3 +589,30 @@ static int cuda_rope_tail_stride_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     return cuda_rope_tail_stride_tensor(x, n_tok, n_head, head_dim, n_rot, pos0, 1u, n_ctx_orig, inverse, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
 }
+
+/* =========================================================================
+ * Test Kernel Wrappers.
+ * =========================================================================
+ *
+ * These expose internal kernels for CPU-GPU comparison testing and can be
+ * reused by external test harnesses.
+ */
+
+extern "C" int ds4_gpu_test_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weight,
+        uint32_t              n,
+        uint32_t              rows,
+        float                 eps) {
+    if (!out || !x || !weight || n == 0) return 0;
+    if (!cuda_tensor_has_elems2(out, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(x, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_f32(weight, n)) return 0;
+    if (rows == 0) return 1;
+    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr,
+                                          (const float *)x->ptr,
+                                          (const float *)weight->ptr,
+                                          n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "test_rms_norm_weight launch");
+}

@@ -789,3 +789,61 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     matmul_f32_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
 }
+
+/* =========================================================================
+ * Test Kernel Wrappers.
+ * =========================================================================
+ *
+ * These expose internal kernels for CPU-GPU comparison testing and can be
+ * reused by external test harnesses.
+ */
+
+extern "C" int ds4_gpu_test_matmul_q8_0_f32_batch_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tokens,
+        uint32_t              in_dim,
+        uint32_t              out_dim) {
+    if (!out || !weights || !x || n_tokens == 0 || in_dim == 0 || out_dim == 0) return 0;
+    if ((in_dim & 31u) != 0) return 0;  /* in_dim must be multiple of 32 */
+
+    const uint32_t n_blocks = in_dim >> 5u;
+    const uint64_t row_bytes = (uint64_t)n_blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+    const uint64_t x_bytes = (uint64_t)n_tokens * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+
+    if (weights->bytes < weight_bytes ||
+        x->bytes < x_bytes ||
+        out->bytes < out_bytes) return 0;
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    /* Use WMMA kernel for large enough workloads */
+    if (out_dim >= 64u && n_tokens >= 64u) {
+        const dim3 grid((out_dim + 63u) / 64u,
+                        (n_tokens + 63u) / 64u,
+                        1u);
+        matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+                (float *)out->ptr,
+                (const unsigned char *)weights->ptr,
+                (const float *)x->ptr,
+                n_tokens,
+                in_dim,
+                out_dim,
+                row_bytes);
+        return cuda_ok(cudaGetLastError(), "test_matmul_q8_0_f32_batch_wmma launch");
+    }
+#endif
+    /* Fallback to warp8 kernel for smaller workloads */
+    dim3 bgrid((out_dim + 7u) / 8u, n_tokens, 1);
+    matmul_q8_0_f32_batch_warp8_kernel<<<bgrid, 256>>>(
+            (float *)out->ptr,
+            (const unsigned char *)weights->ptr,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            n_tokens,
+            n_blocks);
+    return cuda_ok(cudaGetLastError(), "test_matmul_q8_0_f32_batch launch");
+}
