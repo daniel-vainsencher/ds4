@@ -249,5 +249,33 @@ q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
 
+# ============================================================================
+# Oracle libraries for ds4rust testing
+# -Dstatic= removes static linkage so all functions are exported
+# ============================================================================
+
+libds4_oracle.a: ds4_oracle.o
+	$(AR) rcs $@ $^
+
+ds4_oracle.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -Dstatic= -c ds4.c -o $@
+
+ifeq ($(UNAME_S),Darwin)
+oracle: libds4_oracle.a
+oracle-rocm: libds4_oracle.a
+	@echo "ROCm oracle not available on macOS"
+else
+libds4_rocm.a: ds4_rocm_oracle.o
+	$(AR) rcs $@ $^
+
+ds4_rocm_oracle.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
+	$(HIPCC) $(ROCM_CFLAGS) -Dstatic= -c ds4_rocm.cu -o $@
+
+oracle: libds4_oracle.a
+oracle-rocm: libds4_oracle.a libds4_rocm.a
+endif
+
+.PHONY: oracle oracle-rocm
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o libds4_oracle.a libds4_rocm.a
