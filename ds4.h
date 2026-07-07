@@ -5,8 +5,51 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <pthread.h>
 
 #include "ds4_ssd.h"
+
+/* =========================================================================
+ * Quantized Block Structures.
+ * =========================================================================
+ *
+ * Block layouts for K-quants used by routed MoE experts and activations.
+ * These match the GGUF quantization formats and must stay in sync with
+ * the GPU kernel block definitions in ds4_rocm.cu and ds4_cuda.cu.
+ */
+
+#define DS4_QK_K 256
+
+typedef struct {
+    uint8_t  scales[DS4_QK_K / 16];
+    uint8_t  qs[DS4_QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} block_q2_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[DS4_QK_K / 2];
+} block_q4_K;
+
+typedef struct {
+    float   d;
+    int8_t  qs[DS4_QK_K];
+    int16_t bsums[DS4_QK_K / 16];
+} block_q8_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[DS4_QK_K / 8];
+} block_iq2_xxs;
+
+/* IQ2_XXS lookup tables for dequantization.  The signed grid is lazily
+ * initialized on first use via pthread_once. */
+extern int8_t iq2xxs_signed_grid[256][128][8];
+extern pthread_once_t iq2xxs_signed_grid_once;
+void iq2xxs_signed_grid_init(void);
 
 /* Public engine boundary.
  *

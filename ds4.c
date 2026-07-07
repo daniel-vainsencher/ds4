@@ -340,33 +340,10 @@ static int g_ds4_lock_fd = -1;
  *   - Q4_K routed experts in the high-memory variant
  *   - IQ2_XXS routed gate/up experts
  *   - Q8_K temporary activation blocks for dot products
+ *
+ * Block structures are defined in ds4.h for test access.
  */
-#define QK_K 256
-
-typedef struct {
-    uint8_t  scales[QK_K / 16];
-    uint8_t  qs[QK_K / 4];
-    uint16_t d;
-    uint16_t dmin;
-} block_q2_K;
-
-typedef struct {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t  scales[12];
-    uint8_t  qs[QK_K / 2];
-} block_q4_K;
-
-typedef struct {
-    float   d;
-    int8_t  qs[QK_K];
-    int16_t bsums[QK_K / 16];
-} block_q8_K;
-
-typedef struct {
-    uint16_t d;
-    uint16_t qs[QK_K / 8];
-} block_iq2_xxs;
+#define QK_K DS4_QK_K
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
@@ -514,11 +491,11 @@ static const uint64_t iq2xxs_grid[256] = {
     0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
 };
 
-static int8_t iq2xxs_signed_grid[256][128][8];
+int8_t iq2xxs_signed_grid[256][128][8];
 static int8_t iq2xxs_signs[128][8];
-static pthread_once_t iq2xxs_signed_grid_once = PTHREAD_ONCE_INIT;
+pthread_once_t iq2xxs_signed_grid_once = PTHREAD_ONCE_INIT;
 
-static void iq2xxs_signed_grid_init(void) {
+void iq2xxs_signed_grid_init(void) {
     for (uint32_t s = 0; s < 128; s++) {
         const uint8_t signs = ksigns_iq2xs[s];
         for (uint32_t j = 0; j < 8; j++) {
