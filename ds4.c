@@ -27766,3 +27766,389 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+
+/* =========================================================================
+ * Prefill Test Entry Points for ds4rust Oracle Testing.
+ * =========================================================================
+ *
+ * These functions provide clean entry points for testing the full prefill
+ * computation without session/checkpoint overhead. They are exported for
+ * ds4rust FFI consumption.
+ */
+
+int ds4_test_get_vocab_size(void *engine) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e) return 0;
+    return DS4_N_VOCAB;
+}
+
+int ds4_test_get_n_layer(void *engine) {
+    (void)engine;
+    return DS4_N_LAYER;
+}
+
+int ds4_test_get_swa_window(void *engine) {
+    (void)engine;
+    return DS4_N_SWA;
+}
+
+int ds4_test_get_head_dim(void *engine) {
+    (void)engine;
+    return DS4_N_HEAD_DIM;
+}
+
+int ds4_test_prefill_cpu(
+        void *engine,
+        const int32_t *tokens,
+        uint32_t n_tokens,
+        float *out_logits,
+        float *out_kv_raw,
+        uint64_t *out_kv_raw_size) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !tokens || n_tokens == 0) {
+        if (out_kv_raw_size) *out_kv_raw_size = 0;
+        return 1;
+    }
+
+    /* Compute KV cache dimensions */
+    const uint32_t raw_cap = n_tokens < DS4_N_SWA ? n_tokens : DS4_N_SWA;
+    const uint64_t kv_layer_bytes = (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_total_bytes = (uint64_t)DS4_N_LAYER * kv_layer_bytes;
+
+    if (out_kv_raw_size) *out_kv_raw_size = kv_total_bytes;
+
+    /* Build token vector */
+    token_vec prompt = {0};
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        token_vec_push(&prompt, tokens[i]);
+    }
+
+    /* Allocate and initialize KV cache */
+    ds4_kv_cache cache;
+    kv_cache_init(&cache, n_tokens, raw_cap);
+
+    /* Run CPU prefill */
+    prefill_layer_major_cpu(out_logits,
+                            &e->model,
+                            &e->weights,
+                            &cache,
+                            &prompt,
+                            NULL,  /* no steering */
+                            0.0f,
+                            0.0f);
+
+    /* Copy out raw KV cache if requested */
+    if (out_kv_raw) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t n_raw = cache.layer[il].n_raw;
+            const uint32_t actual_raw = n_raw < raw_cap ? n_raw : raw_cap;
+            float *layer_out = out_kv_raw + (uint64_t)il * raw_cap * DS4_N_HEAD_DIM;
+
+            if (actual_raw > 0 && cache.layer[il].raw_kv) {
+                /* Copy in logical order (oldest to newest) */
+                const uint32_t raw_start = n_raw <= raw_cap ? 0 : (n_raw % raw_cap);
+                for (uint32_t r = 0; r < actual_raw; r++) {
+                    const uint32_t phys = (raw_start + r) % raw_cap;
+                    memcpy(layer_out + (uint64_t)r * DS4_N_HEAD_DIM,
+                           cache.layer[il].raw_kv + (uint64_t)phys * DS4_N_HEAD_DIM,
+                           DS4_N_HEAD_DIM * sizeof(float));
+                }
+            } else {
+                memset(layer_out, 0, kv_layer_bytes);
+            }
+        }
+    }
+
+    kv_cache_free(&cache);
+    token_vec_free(&prompt);
+    return 0;
+}
+
+#ifndef DS4_NO_GPU
+int ds4_test_prefill_gpu(
+        void *engine,
+        const int32_t *tokens,
+        uint32_t n_tokens,
+        float *out_logits,
+        float *out_kv_raw,
+        uint64_t *out_kv_raw_size) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !tokens || n_tokens == 0) {
+        if (out_kv_raw_size) *out_kv_raw_size = 0;
+        return 1;
+    }
+
+    if (!e->metal_ready) {
+        fprintf(stderr, "ds4_test_prefill_gpu: GPU backend not initialized\n");
+        if (out_kv_raw_size) *out_kv_raw_size = 0;
+        return 1;
+    }
+
+    /* Compute KV cache dimensions */
+    const uint32_t raw_cap = n_tokens < DS4_N_SWA ? n_tokens : DS4_N_SWA;
+    const uint64_t kv_layer_bytes = (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_total_bytes = (uint64_t)DS4_N_LAYER * kv_layer_bytes;
+
+    if (out_kv_raw_size) *out_kv_raw_size = kv_total_bytes;
+
+    /* Build token vector */
+    token_vec prompt = {0};
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        token_vec_push(&prompt, tokens[i]);
+    }
+
+    /* Allocate GPU graph with appropriate capacity */
+    ds4_gpu_graph g;
+    bool ok = metal_graph_alloc_raw_cap(&g,
+                                        &e->weights,
+                                        &e->weights.layer[0],
+                                        raw_cap,
+                                        n_tokens,  /* ctx_size */
+                                        n_tokens,  /* prefill_cap */
+                                        false);    /* quality */
+    if (!ok) {
+        fprintf(stderr, "ds4_test_prefill_gpu: failed to allocate GPU graph\n");
+        metal_graph_free(&g);
+        token_vec_free(&prompt);
+        return 1;
+    }
+
+    /* Allocate logits buffer if caller wants them */
+    float *logits_buf = out_logits;
+    if (!logits_buf) {
+        logits_buf = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    }
+
+    /* Run GPU prefill */
+    ok = metal_graph_prefill_raw_swa(&g,
+                                     &e->model,
+                                     &e->weights,
+                                     &prompt,
+                                     (int)n_tokens,
+                                     logits_buf,
+                                     false,       /* show_progress */
+                                     NULL,        /* imatrix */
+                                     NULL,        /* display_progress */
+                                     NULL,        /* display_progress_ud */
+                                     NULL,        /* cancelled_cb */
+                                     NULL);       /* cancelled_ud */
+
+    if (!ok) {
+        fprintf(stderr, "ds4_test_prefill_gpu: prefill failed\n");
+        if (!out_logits) free(logits_buf);
+        metal_graph_free(&g);
+        token_vec_free(&prompt);
+        return 1;
+    }
+
+    /* Copy out raw KV cache if requested */
+    if (out_kv_raw) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            float *layer_out = out_kv_raw + (uint64_t)il * raw_cap * DS4_N_HEAD_DIM;
+            if (g.layer_raw_cache[il]) {
+                /* Read GPU KV cache - it's stored in physical ring buffer order */
+                float *gpu_kv = xmalloc(kv_layer_bytes);
+                if (ds4_gpu_tensor_read(g.layer_raw_cache[il], 0, gpu_kv, kv_layer_bytes) != 0) {
+                    /* Reorder from physical to logical order */
+                    const uint32_t actual_raw = n_tokens < raw_cap ? n_tokens : raw_cap;
+                    const uint32_t raw_start = n_tokens <= raw_cap ? 0 : (n_tokens % raw_cap);
+                    for (uint32_t r = 0; r < actual_raw; r++) {
+                        const uint32_t phys = (raw_start + r) % raw_cap;
+                        memcpy(layer_out + (uint64_t)r * DS4_N_HEAD_DIM,
+                               gpu_kv + (uint64_t)phys * DS4_N_HEAD_DIM,
+                               DS4_N_HEAD_DIM * sizeof(float));
+                    }
+                } else {
+                    memset(layer_out, 0, kv_layer_bytes);
+                }
+                free(gpu_kv);
+            } else {
+                memset(layer_out, 0, kv_layer_bytes);
+            }
+        }
+    }
+
+    if (!out_logits) free(logits_buf);
+    metal_graph_free(&g);
+    token_vec_free(&prompt);
+    return 0;
+}
+#else
+int ds4_test_prefill_gpu(
+        void *engine,
+        const int32_t *tokens,
+        uint32_t n_tokens,
+        float *out_logits,
+        float *out_kv_raw,
+        uint64_t *out_kv_raw_size) {
+    (void)engine;
+    (void)tokens;
+    (void)n_tokens;
+    (void)out_logits;
+    (void)out_kv_raw;
+    if (out_kv_raw_size) *out_kv_raw_size = 0;
+    fprintf(stderr, "ds4_test_prefill_gpu: GPU support not compiled in\n");
+    return 1;
+}
+#endif
+
+/* =========================================================================
+ * Decode Test Entry Points
+ * ========================================================================= */
+
+int ds4_test_decode_cpu(
+        void *engine,
+        const int32_t *context_tokens,
+        uint32_t n_context,
+        int32_t new_token,
+        float *out_logits) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !context_tokens || n_context == 0 || !out_logits) {
+        return 1;
+    }
+
+    /* Build context token vector */
+    token_vec context = {0};
+    for (uint32_t i = 0; i < n_context; i++) {
+        token_vec_push(&context, context_tokens[i]);
+    }
+
+    /* Compute KV cache capacity */
+    const uint32_t total_tokens = n_context + 1;
+    const uint32_t raw_cap = total_tokens < DS4_N_SWA ? total_tokens : DS4_N_SWA;
+
+    /* Allocate and initialize KV cache */
+    ds4_kv_cache cache;
+    kv_cache_init(&cache, total_tokens, raw_cap);
+
+    /* Run CPU prefill on context (no logits needed) */
+    prefill_layer_major_cpu(NULL,  /* no logits for prefill */
+                            &e->model,
+                            &e->weights,
+                            &cache,
+                            &context,
+                            NULL,  /* no steering */
+                            0.0f,
+                            0.0f);
+
+    /* Allocate decode scratch */
+    ds4_cpu_decode_scratch scratch;
+    cpu_decode_scratch_init(&scratch, total_tokens);
+
+    /* Run single decode step */
+    forward_token_raw_swa_cpu_decode_scratch(out_logits,
+                                             &e->model,
+                                             &e->weights,
+                                             &cache,
+                                             new_token,
+                                             n_context,  /* pos = context length */
+                                             NULL,       /* no steering */
+                                             0.0f,
+                                             0.0f,
+                                             &scratch);
+
+    cpu_decode_scratch_free(&scratch);
+    kv_cache_free(&cache);
+    token_vec_free(&context);
+    return 0;
+}
+
+#ifndef DS4_NO_GPU
+int ds4_test_decode_gpu(
+        void *engine,
+        const int32_t *context_tokens,
+        uint32_t n_context,
+        int32_t new_token,
+        float *out_logits) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !context_tokens || n_context == 0 || !out_logits) {
+        return 1;
+    }
+
+    if (!e->metal_ready) {
+        fprintf(stderr, "ds4_test_decode_gpu: GPU backend not initialized\n");
+        return 1;
+    }
+
+    /* Build context token vector */
+    token_vec context = {0};
+    for (uint32_t i = 0; i < n_context; i++) {
+        token_vec_push(&context, context_tokens[i]);
+    }
+
+    /* Compute capacities */
+    const uint32_t total_tokens = n_context + 1;
+    const uint32_t raw_cap = total_tokens < DS4_N_SWA ? total_tokens : DS4_N_SWA;
+
+    /* Allocate GPU graph */
+    ds4_gpu_graph g;
+    bool ok = metal_graph_alloc_raw_cap(&g,
+                                        &e->weights,
+                                        &e->weights.layer[0],
+                                        raw_cap,
+                                        total_tokens,  /* ctx_size */
+                                        n_context,     /* prefill_cap */
+                                        false);        /* quality */
+    if (!ok) {
+        fprintf(stderr, "ds4_test_decode_gpu: failed to allocate GPU graph\n");
+        metal_graph_free(&g);
+        token_vec_free(&context);
+        return 1;
+    }
+
+    /* Run GPU prefill on context (no logits needed) */
+    ok = metal_graph_prefill_raw_swa(&g,
+                                     &e->model,
+                                     &e->weights,
+                                     &context,
+                                     (int)n_context,
+                                     NULL,        /* no logits for prefill */
+                                     false,       /* show_progress */
+                                     NULL,        /* imatrix */
+                                     NULL,        /* display_progress */
+                                     NULL,        /* display_progress_ud */
+                                     NULL,        /* cancelled_cb */
+                                     NULL);       /* cancelled_ud */
+
+    if (!ok) {
+        fprintf(stderr, "ds4_test_decode_gpu: prefill failed\n");
+        metal_graph_free(&g);
+        token_vec_free(&context);
+        return 1;
+    }
+
+    /* Run single decode step */
+    ok = metal_graph_eval_token_raw_swa(&g,
+                                        &e->model,
+                                        &e->weights,
+                                        (uint32_t)new_token,
+                                        n_context,  /* pos = context length */
+                                        out_logits);
+
+    if (!ok) {
+        fprintf(stderr, "ds4_test_decode_gpu: decode failed\n");
+        metal_graph_free(&g);
+        token_vec_free(&context);
+        return 1;
+    }
+
+    metal_graph_free(&g);
+    token_vec_free(&context);
+    return 0;
+}
+#else
+int ds4_test_decode_gpu(
+        void *engine,
+        const int32_t *context_tokens,
+        uint32_t n_context,
+        int32_t new_token,
+        float *out_logits) {
+    (void)engine;
+    (void)context_tokens;
+    (void)n_context;
+    (void)new_token;
+    (void)out_logits;
+    fprintf(stderr, "ds4_test_decode_gpu: GPU support not compiled in\n");
+    return 1;
+}
+#endif

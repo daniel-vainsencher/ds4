@@ -1219,6 +1219,186 @@ int ds4_gpu_test_moe_down_q2k_wmma_tensor(
         uint32_t              expert_mid_dim,
         uint32_t              out_dim);
 
+/* HC Sinkhorn Split Test Harness
+ * =========================================================================
+ *
+ * Tests the HC (hyper-connection) split with Sinkhorn normalization.
+ * This is a core prefill operation that produces pre-sublayer mixing weights
+ * from the HC state.
+ *
+ * The operation computes:
+ *   1. pre[i]  = sigmoid(mix[i] * scale[0] + base[i]) + eps
+ *   2. post[i] = 2 * sigmoid(mix[n_hc+i] * scale[1] + base[n_hc+i])
+ *   3. comb[dst,src] = softmax_row(mix[2*n_hc + idx] * scale[2] + base[...])
+ *   4. Sinkhorn iterations: alternating row/column normalization
+ *
+ * Output layout for n_hc=4 (24 floats per row):
+ *   [0..3]    = pre weights (4 floats)
+ *   [4..7]    = post weights (4 floats)
+ *   [8..23]   = comb matrix (4x4 = 16 floats, row-major)
+ *
+ * Parameters:
+ *   out            - Output: [n_rows, 24] float (pre + post + comb)
+ *   mix            - Input:  [n_rows, 24] float (mixing coefficients)
+ *   scale          - Scale:  [3] float (pre_scale, post_scale, comb_scale)
+ *   base           - Base:   [24] float (bias terms)
+ *   n_hc           - Number of hyper-connection streams (must be 4)
+ *   n_rows         - Number of rows (tokens) to process
+ *   sinkhorn_iters - Number of Sinkhorn iterations (typically 3-5)
+ *   eps            - Epsilon for numerical stability (typically 1e-6)
+ */
+int ds4_gpu_test_hc_split_sinkhorn_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *scale,
+        const ds4_gpu_tensor *base,
+        uint32_t              n_hc,
+        uint32_t              n_rows,
+        uint32_t              sinkhorn_iters,
+        float                 eps);
+
+/* =========================================================================
+ * Prefill Test Entry Points.
+ * =========================================================================
+ *
+ * These functions provide clean entry points for testing the full prefill
+ * computation path without session management overhead. They take a loaded
+ * engine and an array of tokens, and produce logits for the final token
+ * plus optionally the raw KV cache state.
+ *
+ * Both CPU and GPU versions are provided for oracle comparison testing.
+ * The functions are designed for ds4rust consumption via FFI.
+ */
+
+/**
+ * CPU prefill test - runs full prefill on CPU and returns final logits.
+ *
+ * This executes the complete prefill computation using the CPU reference
+ * implementation (layer-major order with batched attention/FFN).
+ *
+ * Parameters:
+ *   engine       - Opened ds4 engine with loaded model
+ *   tokens       - Input token IDs [n_tokens]
+ *   n_tokens     - Number of tokens to prefill (must be > 0)
+ *   out_logits   - Output: logits for final token [n_vocab floats]
+ *                  May be NULL if only KV cache output is needed
+ *   out_kv_raw   - Output: raw KV cache data for all layers (optional, may be NULL)
+ *                  Layout: [n_layer][min(n_tokens, swa_window)][head_dim] floats
+ *   out_kv_raw_size - Output: bytes written to out_kv_raw (set even if out_kv_raw is NULL)
+ *
+ * Returns 0 on success, nonzero on error.
+ */
+int ds4_test_prefill_cpu(
+        void *engine,
+        const int32_t *tokens,
+        uint32_t n_tokens,
+        float *out_logits,
+        float *out_kv_raw,
+        uint64_t *out_kv_raw_size);
+
+/**
+ * GPU prefill test - runs full prefill on GPU and returns final logits.
+ *
+ * This executes the complete prefill computation using the GPU implementation
+ * (layer-major order with batched kernels).
+ *
+ * Parameters:
+ *   engine       - Opened ds4 engine with loaded model and initialized GPU
+ *   tokens       - Input token IDs [n_tokens]
+ *   n_tokens     - Number of tokens to prefill (must be > 0)
+ *   out_logits   - Output: logits for final token [n_vocab floats]
+ *                  May be NULL if only KV cache output is needed
+ *   out_kv_raw   - Output: raw KV cache data for all layers (optional, may be NULL)
+ *                  Layout: [n_layer][min(n_tokens, swa_window)][head_dim] floats
+ *   out_kv_raw_size - Output: bytes written to out_kv_raw (set even if out_kv_raw is NULL)
+ *
+ * Returns 0 on success, nonzero on error.
+ */
+int ds4_test_prefill_gpu(
+        void *engine,
+        const int32_t *tokens,
+        uint32_t n_tokens,
+        float *out_logits,
+        float *out_kv_raw,
+        uint64_t *out_kv_raw_size);
+
+/**
+ * Get the vocabulary size for the loaded model.
+ * Useful for allocating the out_logits buffer.
+ */
+int ds4_test_get_vocab_size(void *engine);
+
+/**
+ * Get the number of layers in the model.
+ */
+int ds4_test_get_n_layer(void *engine);
+
+/**
+ * Get the sliding window attention size.
+ */
+int ds4_test_get_swa_window(void *engine);
+
+/**
+ * Get the head dimension (KV cache row size).
+ */
+int ds4_test_get_head_dim(void *engine);
+
+/* =========================================================================
+ * Decode Test Entry Points.
+ * =========================================================================
+ *
+ * These functions test single-token decode (generation) after a prefill.
+ * They take a context (previously prefilled tokens) and a new token,
+ * then produce logits for the next token prediction.
+ *
+ * For testing, the context is re-prefilled internally to establish the
+ * KV cache state, then a single decode step is performed.
+ */
+
+/**
+ * CPU decode test - prefills context, then decodes one token on CPU.
+ *
+ * This first runs CPU prefill on the context tokens to establish KV cache,
+ * then performs a single decode step for the new token.
+ *
+ * Parameters:
+ *   engine         - Opened ds4 engine with loaded model
+ *   context_tokens - Previous context token IDs [n_context]
+ *   n_context      - Number of context tokens (must be > 0)
+ *   new_token      - Single token to decode
+ *   out_logits     - Output: logits for next token prediction [n_vocab floats]
+ *
+ * Returns 0 on success, nonzero on error.
+ */
+int ds4_test_decode_cpu(
+        void *engine,
+        const int32_t *context_tokens,
+        uint32_t n_context,
+        int32_t new_token,
+        float *out_logits);
+
+/**
+ * GPU decode test - prefills context, then decodes one token on GPU.
+ *
+ * This first runs GPU prefill on the context tokens to establish KV cache,
+ * then performs a single decode step for the new token.
+ *
+ * Parameters:
+ *   engine         - Opened ds4 engine with loaded model and initialized GPU
+ *   context_tokens - Previous context token IDs [n_context]
+ *   n_context      - Number of context tokens (must be > 0)
+ *   new_token      - Single token to decode
+ *   out_logits     - Output: logits for next token prediction [n_vocab floats]
+ *
+ * Returns 0 on success, nonzero on error.
+ */
+int ds4_test_decode_gpu(
+        void *engine,
+        const int32_t *context_tokens,
+        uint32_t n_context,
+        int32_t new_token,
+        float *out_logits);
+
 #ifdef __cplusplus
 }
 #endif
