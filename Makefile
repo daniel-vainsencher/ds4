@@ -267,11 +267,10 @@ oracle: libds4_oracle.a
 oracle-rocm: libds4_oracle.a
 	@echo "ROCm oracle not available on macOS"
 else
-libds4_rocm.a: ds4_rocm_oracle.o
+# ROCm oracle uses the regular ds4_rocm.o (no -Dstatic= needed).
+# The ds4_gpu_test_* functions are already extern "C" and exported.
+libds4_rocm.a: ds4_rocm.o
 	$(AR) rcs $@ $^
-
-ds4_rocm_oracle.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
-	$(HIPCC) $(ROCM_CFLAGS) -Dstatic= -c ds4_rocm.cu -o $@
 
 oracle: libds4_oracle.a
 oracle-rocm: libds4_oracle.a libds4_rocm.a
