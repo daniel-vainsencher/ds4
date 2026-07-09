@@ -435,3 +435,36 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                                     n_embd, n_hc,
                                                     "q8_hc_expand");
 }
+
+/* =========================================================================
+ * Test Harness
+ * =========================================================================
+ *
+ * These expose internal kernels for CPU-GPU comparison testing and can be
+ * reused by external test harnesses.
+ */
+
+extern "C" int ds4_gpu_test_hc_split_sinkhorn_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *scale,
+        const ds4_gpu_tensor *base,
+        uint32_t              n_hc,
+        uint32_t              n_rows,
+        uint32_t              sinkhorn_iters,
+        float                 eps) {
+    if (!out || !mix || !scale || !base || n_hc != 4 || n_rows == 0) return 0;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;  // 24 for n_hc=4
+    const uint64_t mix_bytes = mix_hc * sizeof(float);
+    const uint64_t scale_bytes = 3ull * sizeof(float);
+    if (!cuda_tensor_has_bytes(out, n_rows * mix_bytes) ||
+        !cuda_tensor_has_bytes(mix, n_rows * mix_bytes) ||
+        !cuda_tensor_has_bytes(scale, scale_bytes) ||
+        !cuda_tensor_has_bytes(base, mix_bytes)) return 0;
+    hc_split_sinkhorn_kernel<<<(n_rows + 255) / 256, 256>>>(
+        (float *)out->ptr, (const float *)mix->ptr,
+        (const float *)scale->ptr,
+        (const float *)base->ptr,
+        n_rows, sinkhorn_iters, eps);
+    return cuda_ok(cudaGetLastError(), "test_hc_split_sinkhorn launch");
+}

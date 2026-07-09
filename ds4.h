@@ -376,3 +376,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    char *err, size_t errlen);
 
 #endif
+
+/* Test helpers for querying model metadata */
+const void *ds4_engine_get_model_map(ds4_engine *e, uint64_t *out_size);
+uint64_t ds4_engine_find_tensor_offset(ds4_engine *e, const char *name);

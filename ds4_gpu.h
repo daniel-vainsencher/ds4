@@ -1127,6 +1127,27 @@ int ds4_gpu_test_matmul_q8_0_f32_batch_tensor(
         uint32_t              out_dim);
 
 /**
+ * Test F16 matrix multiplication (simplified test harness).
+ *
+ * out[t,r] = sum_k(f16_to_f32(weights[r,k]) * x[t,k])
+ *
+ * Parameters:
+ *   out      - Output: [n_tok, out_dim] float
+ *   weights  - FP16 weights: [out_dim, in_dim] half
+ *   x        - Input: [n_tok, in_dim] float
+ *   n_tok    - Number of input tokens
+ *   in_dim   - Input dimension
+ *   out_dim  - Output dimension
+ */
+int ds4_gpu_test_matmul_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok,
+        uint32_t              in_dim,
+        uint32_t              out_dim);
+
+/**
  * Test attention decode with mixed raw/compressed KV cache.
  *
  * Uses the heads8 online softmax kernel for head_dim=512.

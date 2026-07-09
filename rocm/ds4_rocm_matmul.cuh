@@ -847,3 +847,40 @@ extern "C" int ds4_gpu_test_matmul_q8_0_f32_batch_tensor(
             n_blocks);
     return cuda_ok(cudaGetLastError(), "test_matmul_q8_0_f32_batch launch");
 }
+
+/* =========================================================================
+ * Test Kernel: F16 Matrix Multiplication
+ * =========================================================================
+ *
+ * Simplified test harness that accepts weights directly (no model_map).
+ * Used for CPU-GPU comparison testing.
+ */
+
+extern "C" int ds4_gpu_test_matmul_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_tok,
+        uint32_t              in_dim,
+        uint32_t              out_dim) {
+    if (!out || !weights || !x || n_tok == 0 || in_dim == 0 || out_dim == 0) return 0;
+    
+    const uint64_t weight_bytes = (uint64_t)out_dim * in_dim * sizeof(uint16_t);
+    const uint64_t x_bytes = (uint64_t)n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tok * out_dim * sizeof(float);
+    
+    if (weights->bytes < weight_bytes ||
+        x->bytes < x_bytes ||
+        out->bytes < out_bytes) return 0;
+    
+    /* Use simple matmul_f16_kernel for testing */
+    dim3 grid((unsigned int)out_dim, (unsigned int)n_tok, 1);
+    matmul_f16_kernel<<<grid, 256>>>(
+            (float *)out->ptr,
+            (const __half *)weights->ptr,
+            (const float *)x->ptr,
+            in_dim,
+            out_dim,
+            n_tok);
+    return cuda_ok(cudaGetLastError(), "test_matmul_f16 launch");
+}

@@ -28152,3 +28152,35 @@ int ds4_test_decode_gpu(
     return 1;
 }
 #endif
+
+/* Test helper: Find tensor offset by name from raw model map.
+ * Returns abs_offset or 0 if not found.
+ * This requires the model to be already parsed/loaded. */
+uint64_t ds4_test_find_tensor_offset(const void *model_map, uint64_t model_size, const char *name) {
+    /* For test use: This would need the model to be parsed first.
+     * For now, we'll need to use ds4_engine which handles parsing. */
+    (void)model_map;
+    (void)model_size;
+    (void)name;
+    return 0;
+}
+
+/* =========================================================================
+ * Test Helpers for ds4rust
+ * ========================================================================= */
+
+/* Get model map pointer and size from engine.
+ * Returns pointer to memory-mapped model file. */
+const void *ds4_engine_get_model_map(ds4_engine *e, uint64_t *out_size) {
+    if (!e) return NULL;
+    if (out_size) *out_size = e->model.size;
+    return e->model.map;
+}
+
+/* Find tensor absolute offset by name.
+ * Returns offset in bytes from start of model file, or 0 if not found. */
+uint64_t ds4_engine_find_tensor_offset(ds4_engine *e, const char *name) {
+    if (!e) return 0;
+    ds4_tensor *t = model_find_tensor(&e->model, name);
+    return t ? t->abs_offset : 0;
+}

@@ -272,11 +272,20 @@ else
 libds4_rocm.a: ds4_rocm.o
 	$(AR) rcs $@ $^
 
+# Full GPU oracle includes ds4.c with GPU support for prefill testing.
+# This provides ds4_test_prefill_gpu which needs the full graph infrastructure.
+ds4_gpu_oracle.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Dstatic= -c ds4.c -o $@
+
+libds4_gpu_oracle.a: ds4_gpu_oracle.o ds4_ssd.o ds4_distributed.o ds4_rocm.o
+	$(AR) rcs $@ $^
+
 oracle: libds4_oracle.a
 oracle-rocm: libds4_oracle.a libds4_rocm.a
+oracle-rocm-full: libds4_oracle.a libds4_gpu_oracle.a
 endif
 
-.PHONY: oracle oracle-rocm
+.PHONY: oracle oracle-rocm oracle-rocm-full
 
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o libds4_oracle.a libds4_rocm.a
