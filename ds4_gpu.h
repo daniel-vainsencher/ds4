@@ -109,6 +109,11 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t                     *selected_ids,
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
+int ds4_gpu_stream_expert_cache_prepare_selected_batch_zero_copy(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected);
 #endif
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_stream_expert_cache_load_layer(

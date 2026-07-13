@@ -278,8 +278,39 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                         &gate_ptrs,
                                                         &up_ptrs,
                                                         &down_ptrs,
-                                                        &unique,
-                                                        1);
+                                                         &unique,
+                                                         1);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch_zero_copy(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected) {
+    if (!table) return 0;
+    const ds4_gpu_tensor *selected_exec = NULL;
+    const char **gate_ptrs = NULL;
+    const char **up_ptrs = NULL;
+    const char **down_ptrs = NULL;
+    uint32_t unique = 0;
+    return cuda_stream_batch_selected_prepare_from_host_zero_copy(table->model_map,
+                                                                  table->model_size,
+                                                                  table->layer,
+                                                                  selected_ids,
+                                                                  n_tokens,
+                                                                  table->n_total_expert,
+                                                                  n_selected,
+                                                                  table->gate_offset,
+                                                                  table->up_offset,
+                                                                  table->down_offset,
+                                                                  table->gate_expert_bytes,
+                                                                  table->down_expert_bytes,
+                                                                  &selected_exec,
+                                                                  &gate_ptrs,
+                                                                  &up_ptrs,
+                                                                  &down_ptrs,
+                                                                  &unique,
+                                                                  0);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_load_layer(

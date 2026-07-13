@@ -2338,6 +2338,227 @@ static int cuda_stream_batch_selected_prepare_from_host(
     return ok;
 }
 
+// Zero-copy variant for shared-memory architectures (e.g. gfx1151).
+// Expert weights are accessed directly from the mmap'd model file
+// instead of being copied into separate GPU buffers.
+static int cuda_stream_batch_selected_prepare_from_host_zero_copy(
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t layer,
+        const int32_t *ids,
+        uint32_t n_tokens,
+        uint32_t n_total_expert,
+        uint32_t n_selected,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor **selected_exec,
+        const char ***gate_ptrs,
+        const char ***up_ptrs,
+        const char ***down_ptrs,
+        uint32_t *unique_out,
+        int /*begin_pending*/) {
+    if (!model_map ||
+        !ids ||
+        !selected_exec ||
+        !gate_ptrs ||
+        !up_ptrs ||
+        !down_ptrs ||
+        !unique_out ||
+        n_tokens <= 1 ||
+        n_total_expert == 0 ||
+        n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
+        n_selected == 0 ||
+        n_selected > DS4_ROCM_N_EXPERT_USED ||
+        gate_expert_bytes == 0 ||
+        down_expert_bytes == 0) {
+        return 0;
+    }
+
+    uint64_t n_ids64 = 0;
+    if (!cuda_u64_mul_checked(n_tokens, n_selected, &n_ids64) ||
+        n_ids64 > SIZE_MAX / sizeof(int32_t)) {
+        return 0;
+    }
+    int32_t *compact_ids = (int32_t *)malloc((size_t)n_ids64 * sizeof(compact_ids[0]));
+    if (!compact_ids) {
+        return 0;
+    }
+    uint8_t *pair_missing = (uint8_t *)malloc((size_t)n_ids64);
+    if (!pair_missing) {
+        free(compact_ids);
+        return 0;
+    }
+
+    int ok = 1;
+    int32_t map[DS4_ROCM_MAX_N_EXPERT];
+    int32_t unique_ids[DS4_ROCM_MAX_N_EXPERT];
+    for (uint32_t i = 0; i < DS4_ROCM_MAX_N_EXPERT; i++) map[i] = -1;
+    uint32_t unique_count = 0;
+    for (uint64_t i = 0; i < n_ids64; i++) {
+        const int32_t expert = ids[i];
+        if (expert < 0 || (uint32_t)expert >= n_total_expert) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "zero-copy batch selected expert id %d outside 0..%u "
+                    "(layer=%u)\n",
+                    expert, n_total_expert, layer);
+            ok = 0;
+            break;
+        }
+        int32_t slot = map[(uint32_t)expert];
+        if (slot < 0) {
+            if (unique_count >= DS4_ROCM_MAX_N_EXPERT) {
+                ok = 0;
+                break;
+            }
+            slot = (int32_t)unique_count;
+            map[(uint32_t)expert] = slot;
+            unique_ids[unique_count++] = expert;
+        }
+        compact_ids[i] = slot;
+    }
+    if (ok && unique_count == 0) ok = 0;
+    if (ok && !cuda_stream_batch_selected_ensure_buffers(n_ids64, unique_count)) {
+        ok = 0;
+    }
+    if (ok && !cuda_stream_selected_ensure_stream()) ok = 0;
+
+    const char *gate_host[DS4_ROCM_MAX_N_EXPERT] = {0};
+    const char *up_host[DS4_ROCM_MAX_N_EXPERT] = {0};
+    const char *down_host[DS4_ROCM_MAX_N_EXPERT] = {0};
+
+    for (uint32_t u = 0; ok && u < unique_count; u++) {
+        const int32_t expert_i = unique_ids[u];
+        const uint64_t expert = (uint64_t)(uint32_t)expert_i;
+        uint64_t gate_rel = 0;
+        uint64_t down_rel = 0;
+        if (!cuda_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
+            !cuda_u64_mul_checked(expert, down_expert_bytes, &down_rel) ||
+            gate_rel > model_size ||
+            down_rel > model_size ||
+            gate_offset > model_size ||
+            up_offset > model_size ||
+            down_offset > model_size ||
+            gate_rel > model_size - gate_offset ||
+            gate_rel > model_size - up_offset ||
+            down_rel > model_size - down_offset ||
+            gate_expert_bytes > model_size - gate_offset - gate_rel ||
+            gate_expert_bytes > model_size - up_offset - gate_rel ||
+            down_expert_bytes > model_size - down_offset - down_rel) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "zero-copy batch selected expert offset overflow\n");
+            ok = 0;
+            break;
+        }
+        gate_host[u] = (const char *)model_map + gate_offset + gate_rel;
+        up_host[u]   = (const char *)model_map + up_offset + gate_rel;
+        down_host[u] = (const char *)model_map + down_offset + down_rel;
+    }
+
+    if (ok) {
+        memset(pair_missing, 0, (size_t)n_ids64);
+    }
+
+    if (ok) {
+        cudaError_t err = cudaMemcpyAsync(g_stream_batch_selected_cache.selected_ids,
+                                          compact_ids,
+                                          (size_t)n_ids64 * sizeof(compact_ids[0]),
+                                          cudaMemcpyHostToDevice,
+                                          g_model_upload_stream);
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.pair_missing,
+                                  pair_missing,
+                                  (size_t)n_ids64,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.gate_ptrs,
+                                  gate_host,
+                                  unique_count * sizeof(gate_host[0]),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.up_ptrs,
+                                  up_host,
+                                  unique_count * sizeof(up_host[0]),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.down_ptrs,
+                                  down_host,
+                                  unique_count * sizeof(down_host[0]),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.resident_gate_ptrs,
+                                  gate_host,
+                                  unique_count * sizeof(gate_host[0]),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.resident_up_ptrs,
+                                  up_host,
+                                  unique_count * sizeof(up_host[0]),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.missing_gate_ptrs,
+                                  gate_host,
+                                  unique_count * sizeof(gate_host[0]),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(g_stream_batch_selected_cache.missing_up_ptrs,
+                                  up_host,
+                                  unique_count * sizeof(up_host[0]),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+        }
+        if (err == cudaSuccess) err = cudaStreamSynchronize(g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "zero-copy batch selected table upload failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            ok = 0;
+        }
+    }
+
+    if (ok) {
+        g_stream_batch_selected_cache.loaded = 1;
+        g_stream_batch_selected_cache.model_map = model_map;
+        g_stream_batch_selected_cache.layer = layer;
+        g_stream_batch_selected_cache.n_total_expert = n_total_expert;
+        g_stream_batch_selected_cache.n_selected = n_selected;
+        g_stream_batch_selected_cache.n_tokens = n_tokens;
+        g_stream_batch_selected_cache.n_unique = unique_count;
+        g_stream_batch_selected_cache.gate_offset = gate_offset;
+        g_stream_batch_selected_cache.up_offset = up_offset;
+        g_stream_batch_selected_cache.down_offset = down_offset;
+        g_stream_batch_selected_cache.gate_expert_bytes = gate_expert_bytes;
+        g_stream_batch_selected_cache.down_expert_bytes = down_expert_bytes;
+        *selected_exec = &g_stream_batch_selected_cache.selected_tensor;
+        *gate_ptrs = g_stream_batch_selected_cache.gate_ptrs;
+        *up_ptrs = g_stream_batch_selected_cache.up_ptrs;
+        *down_ptrs = g_stream_batch_selected_cache.down_ptrs;
+        *unique_out = unique_count;
+    } else {
+        g_stream_batch_selected_cache.loaded = 0;
+    }
+
+    free(compact_ids);
+    free(pair_missing);
+    return ok;
+}
+
 static int cuda_stream_batch_selected_prepare(
         const void *model_map,
         uint64_t model_size,
